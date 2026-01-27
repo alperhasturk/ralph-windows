@@ -79,7 +79,7 @@ No other state is hidden or stored elsewhere.
 ## References
 
 - OpenCode CLI `run` docs: https://opencode.ai/docs/cli/#run-1
-- Geoffery Huntley, "Ralph": https://ghuntley.com/ralph/
+- Geoffrey Huntley, "Ralph": https://ghuntley.com/ralph/
 
 ## License
 
