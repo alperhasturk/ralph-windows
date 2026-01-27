@@ -9,10 +9,12 @@ param(
     [switch]$FailOnTimeout
 )
 
+# Script safety defaults and shared state.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:QuoteArgumentMethod = $null
 
+# Workspace and prompt resolution helpers.
 function Resolve-WorkspaceRoot {
     param([string]$WorkspacePath)
 
@@ -68,6 +70,7 @@ function Resolve-PromptSource {
     return $result
 }
 
+# Command-line argument quoting helpers.
 function Quote-CommandLineArgument {
     param([string]$Value)
 
@@ -137,6 +140,7 @@ function Join-Args {
     return ($quoted -join " ")
 }
 
+# Output formatting and filtering helpers.
 function Format-Color {
     param(
         [string]$Text,
@@ -228,6 +232,7 @@ function Print-FilteredOutput {
     }
 }
 
+# Iteration summary and state helpers.
 function Write-IterationSummary {
     param(
         [int]$Iteration,
@@ -306,6 +311,7 @@ function Write-State {
     $json | Set-Content -LiteralPath $StatePath -Encoding utf8
 }
 
+# Verification command runner.
 function Invoke-VerifyCommand {
     param(
         [string]$Command,
@@ -342,7 +348,9 @@ function Invoke-VerifyCommand {
     }
 }
 
+# Main loop: resolve inputs, run iterations, and stop on completion.
 try {
+    # Validate inputs and resolve prompt sources.
     if ($MaxIterations -lt 1) {
         throw "MaxIterations must be at least 1."
     }
@@ -355,6 +363,7 @@ try {
         throw "opencode not found on PATH. Install OpenCode or add it to PATH."
     }
 
+    # Prepare workspace state/log directories.
     $ralphDir = Join-Path $workspaceRoot ".ralph"
     $logDir = Join-Path $ralphDir "logs"
     Ensure-Directory -Path $ralphDir
@@ -362,6 +371,7 @@ try {
 
     $statePath = Join-Path $ralphDir "state.json"
 
+    # Iteration loop: run OpenCode and evaluate completion.
     for ($i = 1; $i -le $MaxIterations; $i++) {
         $iterId = "{0:D3}" -f $i
         $logPath = Join-Path $logDir "iter-$iterId.log"
@@ -386,7 +396,8 @@ try {
         Write-Host ("  Promise       : {0}" -f $Promise)
         Write-Host $boxLine
 
-        $opencodeArgs = @("run", "Follow the instructions in the attached prompt file.")
+        # Assemble OpenCode command and write log headers.
+        $opencodeArgs = @("run", "Follow the instructions in the attached prompt file.") #opencode run command needs a message to work can't pass in the prompt.md file without a message
         if ($promptSource.Type -eq "inline") {
             $inlinePromptPath = Join-Path $ralphDir ("prompt-inline-$iterId.md")
             $promptSource.Value | Set-Content -LiteralPath $inlinePromptPath -Encoding utf8
@@ -410,6 +421,7 @@ try {
 
         $outputBuilder = New-Object System.Text.StringBuilder
 
+        # Start OpenCode process and enforce timeout.
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = "opencode"
         $startInfo.Arguments = Join-Args $opencodeArgs
@@ -490,6 +502,7 @@ try {
         }
         Start-Sleep -Milliseconds 100
 
+        # Collect output and write logs.
         Write-Phase "Collecting output"
 
         $stdout = ""
@@ -543,6 +556,7 @@ try {
             continue
         }
 
+        # Detect completion promise and optionally verify.
         Write-Phase "Checking for completion"
 
         $outputText = $outputBuilder.ToString()
@@ -598,6 +612,7 @@ try {
         Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$false -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
     }
 
+    # Max iterations reached without completion.
     $lastLogPath = Join-Path $logDir ("iter-{0:D3}.log" -f $MaxIterations)
     Write-Host "Max iterations reached without completion."
     Write-Host "Logs directory: $logDir"
