@@ -137,6 +137,145 @@ function Join-Args {
     return ($quoted -join " ")
 }
 
+function Format-Color {
+    param(
+        [string]$Text,
+        [string]$Color
+    )
+    return $Text
+}
+
+function Write-Phase {
+    param([string]$Message)
+
+    $label = Format-Color -Text "Phase" -Color "cyan"
+    Write-Host ("{0}: {1}" -f $label, $Message)
+}
+
+function Remove-AnsiEscape {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return $Text
+    }
+
+    return [regex]::Replace($Text, "\x1B\[[0-9;]*[A-Za-z]", "")
+}
+
+function Should-PrintLine {
+    param(
+        [string]$PlainLine,
+        [string]$PromiseText
+    )
+
+    if ($null -eq $PlainLine) {
+        return $false
+    }
+
+    $trimmed = $PlainLine.Trim()
+    if ($trimmed.Length -eq 0) {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrEmpty($PromiseText) -and $trimmed -eq $PromiseText.Trim()) {
+        return $false
+    }
+
+    if ($trimmed -match '^(INFO|DEBUG)\s+\d{4}-\d{2}-\d{2}T') {
+        return $false
+    }
+
+    if ($trimmed -match '^\|\s+(apply_patch|Apply_patch)\b') {
+        return $true
+    }
+
+    if ($trimmed -match '^\|\s+\w+') {
+        return $false
+    }
+
+    return $true
+}
+
+function Print-FilteredOutput {
+    param(
+        [string]$Text,
+        [string]$PromiseText,
+        [ref]$InSystemReminder
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return
+    }
+
+    $lines = [regex]::Split($Text, "\r?\n")
+    foreach ($line in $lines) {
+        $plainLine = Remove-AnsiEscape -Text $line
+
+        if ($plainLine -match '<system-reminder>') {
+            $InSystemReminder.Value = $true
+            continue
+        }
+        if ($InSystemReminder.Value) {
+            if ($plainLine -match '</system-reminder>') {
+                $InSystemReminder.Value = $false
+            }
+            continue
+        }
+
+        if (Should-PrintLine -PlainLine $plainLine -PromiseText $PromiseText) {
+            Write-Host $plainLine
+        }
+    }
+}
+
+function Write-IterationSummary {
+    param(
+        [int]$Iteration,
+        [int]$MaxIterations,
+        [string]$Status,
+        [int]$ExitCode,
+        [TimeSpan]$Duration,
+        [bool]$PromiseDetected,
+        [Nullable[int]]$VerifyExitCode,
+        [string]$VerifyCommand
+    )
+
+    $durationString = $Duration.ToString("hh\:mm\:ss")
+
+    $statusColor = "gray"
+    if ($Status -eq "timeout") {
+        $statusColor = "yellow"
+    } elseif ($ExitCode -ne 0) {
+        $statusColor = "red"
+    } elseif ($PromiseDetected) {
+        $statusColor = "green"
+    } else {
+        $statusColor = "cyan"
+    }
+
+    $exitColor = if ($ExitCode -ne 0) { "red" } else { "green" }
+    $promiseLabel = if ($PromiseDetected) { Format-Color -Text "detected" -Color "green" } else { "not found" }
+
+    Write-Host ""
+    Write-Host "Summary"
+    Write-Host ("  Iteration : {0}/{1}" -f $Iteration, $MaxIterations)
+    Write-Host ("  Status    : {0}" -f (Format-Color -Text $Status -Color $statusColor))
+    Write-Host ("  Exit Code : {0}" -f (Format-Color -Text $ExitCode.ToString() -Color $exitColor))
+    Write-Host ("  Duration  : {0}" -f $durationString)
+    Write-Host ("  Promise   : {0}" -f $promiseLabel)
+
+    if (-not [string]::IsNullOrWhiteSpace($VerifyCommand)) {
+        if ($null -eq $VerifyExitCode) {
+            $verifyLabel = "skipped"
+        } elseif ($VerifyExitCode -eq 0) {
+            $verifyLabel = Format-Color -Text "passed" -Color "green"
+        } else {
+            $verifyLabel = Format-Color -Text ("failed ($VerifyExitCode)") -Color "red"
+        }
+        Write-Host ("  Verify    : {0}" -f $verifyLabel)
+    }
+}
+
 function Ensure-Directory {
     param([string]$Path)
 
@@ -228,10 +367,24 @@ try {
         $logPath = Join-Path $logDir "iter-$iterId.log"
         $startedAt = Get-Date
 
+        $boxLine = "=" * 55
+        $timeoutLabel = if ($IterationTimeoutSeconds -and $IterationTimeoutSeconds -gt 0) { "${IterationTimeoutSeconds}s" } else { "none" }
+
         Write-Host ""
-        Write-Host "==============================================="
-        Write-Host "  Ralph Iteration $iterId of $MaxIterations"
-        Write-Host "==============================================="
+        Write-Host $boxLine
+        Write-Host ("  Ralph Loop :: Iteration {0}/{1}" -f $iterId, $MaxIterations)
+        Write-Host $boxLine
+        Write-Host ("  Workspace     : {0}" -f $workspaceRoot)
+        Write-Host ("  Prompt Source : {0}" -f $promptSource.Type)
+        if ($promptSource.Type -eq "file") {
+            Write-Host ("  Prompt File   : {0}" -f $promptSource.Value)
+        } else {
+            $inlineLength = if ($null -ne $promptSource.Value) { $promptSource.Value.Length } else { 0 }
+            Write-Host ("  Prompt Inline : {0} chars" -f $inlineLength)
+        }
+        Write-Host ("  Timeout       : {0}" -f $timeoutLabel)
+        Write-Host ("  Promise       : {0}" -f $Promise)
+        Write-Host $boxLine
 
         $opencodeArgs = @("run", "Follow the instructions in the attached prompt file.")
         if ($promptSource.Type -eq "inline") {
@@ -272,6 +425,8 @@ try {
         $process.StartInfo = $startInfo
         $process.EnableRaisingEvents = $true
 
+        Write-Phase "Starting OpenCode"
+
         $null = $process.Start()
 
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
@@ -310,7 +465,7 @@ try {
                 $elapsed = $now - $startedAt
                 $elapsedString = $elapsed.ToString("hh\:mm\:ss")
                 $spinner = $spinnerFrames[$spinnerIndex % $spinnerFrames.Length]
-                $status = "$spinner Running OpenCode... $elapsedString"
+                $status = "$spinner Iter $iterId/$MaxIterations still running... $elapsedString"
                 if ($lastStatus -and $lastStatus.Length -gt $status.Length) {
                     $status = $status + (' ' * ($lastStatus.Length - $status.Length))
                 }
@@ -335,6 +490,8 @@ try {
         }
         Start-Sleep -Milliseconds 100
 
+        Write-Phase "Collecting output"
+
         $stdout = ""
         $stderr = ""
         try {
@@ -346,16 +503,18 @@ try {
         } catch {
         }
 
+        $inSystemReminder = $false
+
         if (-not [string]::IsNullOrWhiteSpace($stdout)) {
             $outputBuilder.Append($stdout) | Out-Null
             $logWriter.Write($stdout)
-            Write-Host $stdout
+            Print-FilteredOutput -Text $stdout -PromiseText $Promise -InSystemReminder ([ref]$inSystemReminder)
         }
 
         if (-not [string]::IsNullOrWhiteSpace($stderr)) {
             $outputBuilder.Append($stderr) | Out-Null
             $logWriter.Write($stderr)
-            Write-Host $stderr
+            Print-FilteredOutput -Text $stderr -PromiseText $Promise -InSystemReminder ([ref]$inSystemReminder)
         }
 
         $logWriter.Flush()
@@ -377,18 +536,27 @@ try {
 
         if ($timedOut) {
             Write-Host "Iteration $iterId timed out after $IterationTimeoutSeconds seconds."
+            Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$false -VerifyExitCode $null -VerifyCommand $VerifyCommand
             if ($FailOnTimeout) {
                 exit 4
             }
             continue
         }
 
+        Write-Phase "Checking for completion"
+
         $outputText = $outputBuilder.ToString()
+        $verifyExitCode = $null
         $hasPromise = $outputText -match [regex]::Escape($Promise)
         if (-not $hasPromise) {
             try {
                 $logText = Get-Content -LiteralPath $logPath -Raw -ErrorAction Stop
-                $hasPromise = $logText -match [regex]::Escape($Promise)
+                $logOutput = $logText
+                $outputMatch = [regex]::Match($logText, "(?s)# --- output ---\s*(.*?)# --- end ---")
+                if ($outputMatch.Success) {
+                    $logOutput = $outputMatch.Groups[1].Value
+                }
+                $hasPromise = $logOutput -match [regex]::Escape($Promise)
             } catch {
             }
         }
@@ -396,6 +564,7 @@ try {
         if ($hasPromise) {
             if (-not [string]::IsNullOrWhiteSpace($VerifyCommand)) {
                 $verifyResult = Invoke-VerifyCommand -Command $VerifyCommand -WorkspaceRoot $workspaceRoot
+                $verifyExitCode = $verifyResult.ExitCode
                 $logAppend = New-Object System.IO.StreamWriter($logPath, $true, (New-Object System.Text.UTF8Encoding($false)))
                 $logAppend.WriteLine("# verify_exit_code: $($verifyResult.ExitCode)")
                 $logAppend.WriteLine("# verify_stdout:")
@@ -410,19 +579,23 @@ try {
                 $logAppend.Dispose()
 
                 if ($verifyResult.ExitCode -eq 0) {
+                    Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$true -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
                     exit 0
                 }
 
                 Write-Host "Promise detected but verify command failed. Continuing."
+                Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$true -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
                 continue
             }
 
+            Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$true -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
             exit 0
         }
 
         if ($process.ExitCode -ne 0) {
             Write-Host "Iteration $iterId exited with code $($process.ExitCode). Continuing."
         }
+        Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$false -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
     }
 
     $lastLogPath = Join-Path $logDir ("iter-{0:D3}.log" -f $MaxIterations)
