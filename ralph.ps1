@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:QuoteArgumentMethod = $null
 
 function Resolve-WorkspaceRoot {
     param([string]$WorkspacePath)
@@ -67,11 +68,71 @@ function Resolve-PromptSource {
     return $result
 }
 
-function Join-Args {
-    param([string[]]$Args)
+function Quote-CommandLineArgument {
+    param([string]$Value)
 
-    $quoted = foreach ($arg in $Args) {
-        [System.Management.Automation.Language.CodeGeneration]::QuoteArgument($arg)
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    if ($Value.Length -eq 0) {
+        return '""'
+    }
+
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    $builder.Append('"') | Out-Null
+
+    $index = 0
+    while ($index -lt $Value.Length) {
+        $backslashCount = 0
+        while ($index -lt $Value.Length -and $Value[$index] -eq '\\') {
+            $backslashCount++
+            $index++
+        }
+
+        if ($index -ge $Value.Length) {
+            if ($backslashCount -gt 0) {
+                $builder.Append(('\\' * ($backslashCount * 2))) | Out-Null
+            }
+            break
+        }
+
+        if ($Value[$index] -eq '"') {
+            if ($backslashCount -gt 0) {
+                $builder.Append(('\\' * ($backslashCount * 2))) | Out-Null
+            }
+            $builder.Append('\"') | Out-Null
+            $index++
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            $builder.Append(('\\' * $backslashCount)) | Out-Null
+        }
+        $builder.Append($Value[$index]) | Out-Null
+        $index++
+    }
+
+    $builder.Append('"') | Out-Null
+    return $builder.ToString()
+}
+
+function Join-Args {
+    param([string[]]$CommandArgs)
+
+    $quoted = foreach ($arg in $CommandArgs) {
+        if ($null -eq $script:QuoteArgumentMethod) {
+            $script:QuoteArgumentMethod = [System.Management.Automation.Language.CodeGeneration].GetMethod("QuoteArgument", [type[]]@([string]))
+        }
+        if ($script:QuoteArgumentMethod) {
+            $script:QuoteArgumentMethod.Invoke($null, @($arg))
+        } else {
+            Quote-CommandLineArgument -Value $arg
+        }
     }
     return ($quoted -join " ")
 }
@@ -172,13 +233,13 @@ try {
         Write-Host "  Ralph Iteration $iterId of $MaxIterations"
         Write-Host "==============================================="
 
-        $args = @("run")
+        $opencodeArgs = @("run", "Follow the instructions in the attached prompt file.")
         if ($promptSource.Type -eq "inline") {
             $inlinePromptPath = Join-Path $ralphDir ("prompt-inline-$iterId.md")
             $promptSource.Value | Set-Content -LiteralPath $inlinePromptPath -Encoding utf8
-            $args += @("--file", $inlinePromptPath)
+            $opencodeArgs += @("--file", $inlinePromptPath)
         } else {
-            $args += @("--file", $promptSource.Value)
+            $opencodeArgs += @("--file", $promptSource.Value)
         }
 
         $logWriter = New-Object System.IO.StreamWriter($logPath, $false, (New-Object System.Text.UTF8Encoding($false)))
@@ -186,7 +247,7 @@ try {
         $logWriter.WriteLine("# started_at: $($startedAt.ToString("o"))")
         $logWriter.WriteLine("# workspace: $workspaceRoot")
         $logWriter.WriteLine("# prompt_source: $($promptSource.Type)")
-        $logWriter.WriteLine("# command: opencode $(Join-Args $args)")
+        $logWriter.WriteLine("# command: opencode $(Join-Args $opencodeArgs)")
         $logWriter.WriteLine("# promise: $Promise")
         $logWriter.WriteLine("# max_iterations: $MaxIterations")
         $logWriter.WriteLine("# timeout_seconds: $IterationTimeoutSeconds")
@@ -195,54 +256,44 @@ try {
         $logWriter.Flush()
 
         $outputBuilder = New-Object System.Text.StringBuilder
-        $script:closing = $false
 
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = "opencode"
-        $startInfo.Arguments = Join-Args $args
+        $startInfo.Arguments = Join-Args $opencodeArgs
         $startInfo.WorkingDirectory = $workspaceRoot
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
+        $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
         $process.EnableRaisingEvents = $true
+
         $null = $process.Start()
 
-        $process.add_OutputDataReceived({
-            param($sender, $eventArgs)
-            if ($script:closing) {
-                return
-            }
-            if ($null -ne $eventArgs.Data) {
-                $outputBuilder.AppendLine($eventArgs.Data) | Out-Null
-                Write-Host $eventArgs.Data
-                $logWriter.WriteLine($eventArgs.Data)
-                $logWriter.Flush()
-            }
-        })
-
-        $process.add_ErrorDataReceived({
-            param($sender, $eventArgs)
-            if ($script:closing) {
-                return
-            }
-            if ($null -ne $eventArgs.Data) {
-                $outputBuilder.AppendLine($eventArgs.Data) | Out-Null
-                Write-Host $eventArgs.Data
-                $logWriter.WriteLine($eventArgs.Data)
-                $logWriter.Flush()
-            }
-        })
-
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
 
         $timedOut = $false
+        $deadline = $null
         if ($IterationTimeoutSeconds -and $IterationTimeoutSeconds -gt 0) {
-            if (-not $process.WaitForExit($IterationTimeoutSeconds * 1000)) {
+            $deadline = $startedAt.AddSeconds($IterationTimeoutSeconds)
+        }
+
+        $heartbeatIntervalSeconds = 2
+        $nextHeartbeat = (Get-Date).AddSeconds($heartbeatIntervalSeconds)
+        $spinnerFrames = @('|', '/', '-', '\')
+        $spinnerIndex = 0
+        $lastStatus = $null
+
+        while (-not $process.HasExited) {
+            Start-Sleep -Milliseconds 200
+            $now = Get-Date
+
+            if ($deadline -and $now -ge $deadline) {
                 $timedOut = $true
                 try {
                     $process.Kill($true)
@@ -252,20 +303,62 @@ try {
                     } catch {
                     }
                 }
+                break
+            }
+
+            if ($now -ge $nextHeartbeat) {
+                $elapsed = $now - $startedAt
+                $elapsedString = $elapsed.ToString("hh\:mm\:ss")
+                $spinner = $spinnerFrames[$spinnerIndex % $spinnerFrames.Length]
+                $status = "$spinner Running OpenCode... $elapsedString"
+                if ($lastStatus -and $lastStatus.Length -gt $status.Length) {
+                    $status = $status + (' ' * ($lastStatus.Length - $status.Length))
+                }
+                Write-Host -NoNewline ("`r{0}" -f $status)
+                $lastStatus = $status
+                $spinnerIndex++
+                $nextHeartbeat = $now.AddSeconds($heartbeatIntervalSeconds)
             }
         }
 
-        if (-not $timedOut) {
-            $process.WaitForExit()
-        }
-
-        $script:closing = $true
         try {
-            $process.CancelOutputRead()
-            $process.CancelErrorRead()
+            if (-not $timedOut) {
+                $process.WaitForExit()
+            } else {
+                $process.WaitForExit(5000) | Out-Null
+            }
         } catch {
         }
+
+        if ($lastStatus) {
+            Write-Host ""
+        }
         Start-Sleep -Milliseconds 100
+
+        $stdout = ""
+        $stderr = ""
+        try {
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+        } catch {
+        }
+        try {
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+        } catch {
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+            $outputBuilder.Append($stdout) | Out-Null
+            $logWriter.Write($stdout)
+            Write-Host $stdout
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+            $outputBuilder.Append($stderr) | Out-Null
+            $logWriter.Write($stderr)
+            Write-Host $stderr
+        }
+
+        $logWriter.Flush()
 
         $endedAt = Get-Date
         $duration = $endedAt - $startedAt
