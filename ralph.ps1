@@ -215,11 +215,15 @@ function Print-FilteredOutput {
     foreach ($line in $lines) {
         $plainLine = Remove-AnsiEscape -Text $line
 
-        if ($plainLine -match '<system-reminder>') {
-            $InSystemReminder.Value = $true
-            continue
-        }
-        if ($InSystemReminder.Value) {
+        if (-not $InSystemReminder.Value) {
+            if ($plainLine -match '<system-reminder>') {
+                if ($plainLine -match '</system-reminder>') {
+                    continue
+                }
+                $InSystemReminder.Value = $true
+                continue
+            }
+        } else {
             if ($plainLine -match '</system-reminder>') {
                 $InSystemReminder.Value = $false
             }
@@ -507,12 +511,20 @@ try {
 
         $stdout = ""
         $stderr = ""
+        $taskWaitMilliseconds = 2000
+        if ($timedOut -and -not $process.HasExited) {
+            $taskWaitMilliseconds = 200
+        }
         try {
-            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            if ($stdoutTask -and $stdoutTask.Wait($taskWaitMilliseconds)) {
+                $stdout = $stdoutTask.Result
+            }
         } catch {
         }
         try {
-            $stderr = $stderrTask.GetAwaiter().GetResult()
+            if ($stderrTask -and $stderrTask.Wait($taskWaitMilliseconds)) {
+                $stderr = $stderrTask.Result
+            }
         } catch {
         }
 
