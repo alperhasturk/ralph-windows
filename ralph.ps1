@@ -606,8 +606,8 @@ try {
             exit 0
         }
 
-        if ($process.ExitCode -ne 0) {
-            Write-Host "Iteration $iterId exited with code $($process.ExitCode). Continuing."
+        if ($exitCode -ne 0) {
+            Write-Host "Iteration $iterId exited with code $exitCode. Continuing."
         }
         Write-IterationSummary -Iteration $i -MaxIterations $MaxIterations -Status $status -ExitCode $exitCode -Duration $duration -PromiseDetected:$false -VerifyExitCode $verifyExitCode -VerifyCommand $VerifyCommand
     }
